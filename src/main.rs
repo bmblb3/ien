@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -7,7 +8,12 @@ use std::time::Duration;
 use serde_json::Value;
 use ureq::json;
 
-const ROUTING_SYSTEM_PROMPT: &str = "You are the routing stage of a personal finance Telegram assistant backed by pennywise, a personal finance ledger REST API. Given the user's message and pennywise's OpenAPI schema, pick exactly one GET endpoint that can answer the question, write a jq filter that extracts the relevant data from that endpoint's JSON response, and write a system prompt for a second LLM call that will turn the filtered JSON into a natural-language reply to the user. Only GET endpoints are available — never suggest a write operation.";
+/// Reads a prompt file fresh on every call, so editing prompt wording takes effect
+/// on the next message without restarting or recompiling the bot.
+fn read_prompt_file(path: &str) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read prompt file '{path}': {err}"))
+}
 
 struct Plan {
     endpoint: String,
@@ -72,6 +78,7 @@ fn plan_json_schema(endpoints: &[String]) -> Value {
 fn build_plan(
     openrouter_api_key: &str,
     openrouter_model: &str,
+    routing_system_prompt: &str,
     api_schema: &Value,
     user_message: &str,
 ) -> Result<Plan, String> {
@@ -84,7 +91,7 @@ fn build_plan(
         "model": openrouter_model,
         "require_parameters": true,
         "messages": [
-            {"role": "system", "content": ROUTING_SYSTEM_PROMPT},
+            {"role": "system", "content": routing_system_prompt},
             {"role": "user", "content": format!(
                 "User's message: {user_message}\n\nPennywise's OpenAPI schema:\n{api_schema}"
             )}
@@ -199,6 +206,10 @@ fn main() {
         env::var("OPENROUTER_API_KEY").expect("set OPENROUTER_API_KEY to an OpenRouter API key");
     let openrouter_model =
         env::var("OPENROUTER_MODEL").expect("set OPENROUTER_MODEL to an OpenRouter model id");
+    let routing_prompt_path =
+        env::var("ROUTING_PROMPT_PATH").unwrap_or_else(|_| "prompts/routing.md".to_string());
+    let reply_prompt_path =
+        env::var("REPLY_PROMPT_PATH").unwrap_or_else(|_| "prompts/reply.md".to_string());
     let api = format!("https://api.telegram.org/bot{token}");
 
     let mut offset = 0i64;
@@ -242,16 +253,28 @@ fn main() {
                 }
             };
 
-            let reply = match build_plan(&openrouter_api_key, &openrouter_model, &api_schema, text)
-            {
+            let routing_system_prompt = read_prompt_file(&routing_prompt_path);
+            let reply_style = read_prompt_file(&reply_prompt_path);
+
+            let reply = match build_plan(
+                &openrouter_api_key,
+                &openrouter_model,
+                &routing_system_prompt,
+                &api_schema,
+                text,
+            ) {
                 Ok(plan) => match execute_plan(&pennywise_url, &plan) {
-                    Ok(jq_output) => build_reply(
-                        &openrouter_api_key,
-                        &openrouter_model,
-                        &plan.reply_system_prompt,
-                        &jq_output,
-                    )
-                    .unwrap_or_else(|err| err),
+                    Ok(jq_output) => {
+                        let reply_system_prompt =
+                            format!("{reply_style}\n\n{}", plan.reply_system_prompt);
+                        build_reply(
+                            &openrouter_api_key,
+                            &openrouter_model,
+                            &reply_system_prompt,
+                            &jq_output,
+                        )
+                        .unwrap_or_else(|err| err)
+                    }
                     Err(err) => err,
                 },
                 Err(err) => err,
