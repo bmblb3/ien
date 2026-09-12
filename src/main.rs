@@ -256,30 +256,32 @@ fn main() {
             let routing_system_prompt = read_prompt_file(&routing_prompt_path);
             let reply_style = read_prompt_file(&reply_prompt_path);
 
-            let reply = match build_plan(
+            let result: Result<String, String> = build_plan(
                 &openrouter_api_key,
                 &openrouter_model,
                 &routing_system_prompt,
                 &api_schema,
                 text,
-            ) {
-                Ok(plan) => match execute_plan(&pennywise_url, &plan) {
-                    Ok(jq_output) => {
-                        let reply_system_prompt =
-                            format!("{reply_style}\n\n{}", plan.reply_system_prompt);
-                        build_reply(
-                            &openrouter_api_key,
-                            &openrouter_model,
-                            &reply_system_prompt,
-                            &jq_output,
-                        )
-                        .unwrap_or_else(|err| err)
-                    }
-                    Err(err) => err,
-                },
-                Err(err) => err,
-            };
+            )
+            .and_then(|plan| {
+                eprintln!(
+                    "chat {chat_id}: plan endpoint={:?} jq_filter={:?}",
+                    plan.endpoint, plan.jq_filter
+                );
+                let jq_output = execute_plan(&pennywise_url, &plan)?;
+                let reply_system_prompt = format!("{reply_style}\n\n{}", plan.reply_system_prompt);
+                build_reply(
+                    &openrouter_api_key,
+                    &openrouter_model,
+                    &reply_system_prompt,
+                    &jq_output,
+                )
+            });
 
+            let reply = result.unwrap_or_else(|err| {
+                eprintln!("chat {chat_id}: {err}");
+                err
+            });
             send_message(&api, chat_id, &reply);
         }
     }
@@ -346,5 +348,18 @@ mod tests {
     #[test]
     fn run_jq_reports_an_invalid_filter() {
         assert!(run_jq("{}", "not valid jq").is_err());
+    }
+
+    #[test]
+    fn run_jq_null_coalescing_survives_a_null_field() {
+        let input = r#"[{"account_name":"Swedbank"},{"account_name":null},{"other":"x"}]"#;
+        let result = run_jq(
+            input,
+            r#"map(select((.account_name? // "") | test("swedbank"; "i")))"#,
+        )
+        .unwrap();
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed, json!([{"account_name": "Swedbank"}]));
     }
 }

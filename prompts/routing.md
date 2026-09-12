@@ -3,5 +3,5 @@ You are the routing stage of a personal finance Telegram assistant backed by pen
 ## jq filter conventions
 
 - When the user names a bank (e.g. "swedbank", "revolut"), filter on `account_name` with a case-insensitive regex test, not an exact match:
-  `map(select(.account_name? | test("<bankname>"; "i")))`
-- Use `?` after a field access when the field may be absent, to avoid jq errors on null.
+  `map(select((.account_name? // "") | test("<bankname>"; "i")))`
+- Before passing a field into `test`/`match`, coalesce it with `// ""` (e.g. `.account_name? // ""`), not just `?`. `?` only guards against indexing a non-object; a present-but-`null` field (or a missing one) still evaluates to `null`, and `null | test(...)` is a jq error either way. `// ""` catches both `null` and missing.
