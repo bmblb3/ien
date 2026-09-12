@@ -112,6 +112,35 @@ fn build_plan(
     Plan::from_json_str(content)
 }
 
+/// The Reply Call: turns a Plan's jq'd JSON output into a final plain-text reply, using the
+/// system prompt the Routing Call wrote for exactly this purpose.
+fn build_reply(
+    openrouter_api_key: &str,
+    openrouter_model: &str,
+    reply_system_prompt: &str,
+    jq_output: &str,
+) -> Result<String, String> {
+    let body = json!({
+        "model": openrouter_model,
+        "require_parameters": true,
+        "messages": [
+            {"role": "system", "content": reply_system_prompt},
+            {"role": "user", "content": jq_output}
+        ]
+    });
+
+    let response: Value = ureq::post("https://openrouter.ai/api/v1/chat/completions")
+        .set("Authorization", &format!("Bearer {openrouter_api_key}"))
+        .send_json(body)
+        .and_then(|res| res.into_json::<Value>().map_err(Into::into))
+        .map_err(|err| format!("reply call failed: {err}"))?;
+
+    response["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("reply call returned no content: {response}"))
+}
+
 /// Pipes `input` through a real `jq` subprocess running `filter` and returns its stdout.
 fn run_jq(input: &str, filter: &str) -> Result<String, String> {
     let mut jq = Command::new("jq")
@@ -216,9 +245,13 @@ fn main() {
             let reply = match build_plan(&openrouter_api_key, &openrouter_model, &api_schema, text)
             {
                 Ok(plan) => match execute_plan(&pennywise_url, &plan) {
-                    // TODO(#5): run the Reply Call using plan.reply_system_prompt instead of
-                    // echoing the raw jq output.
-                    Ok(result) => result,
+                    Ok(jq_output) => build_reply(
+                        &openrouter_api_key,
+                        &openrouter_model,
+                        &plan.reply_system_prompt,
+                        &jq_output,
+                    )
+                    .unwrap_or_else(|err| err),
                     Err(err) => err,
                 },
                 Err(err) => err,
