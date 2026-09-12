@@ -7,7 +7,10 @@ use ureq::json;
 fn main() {
     let token = env::var("TELEGRAM_BOT_TOKEN")
         .expect("set TELEGRAM_BOT_TOKEN to the token from @BotFather");
+    let pennywise_url =
+        env::var("PENNYWISE_URL").expect("set PENNYWISE_URL to the pennywise host");
     let api = format!("https://api.telegram.org/bot{token}");
+    let balances_url = format!("http://{pennywise_url}:8080/balances");
 
     let mut offset = 0i64;
     loop {
@@ -32,8 +35,16 @@ fn main() {
                 continue;
             };
 
+            let text = match ureq::get(&balances_url)
+                .call()
+                .and_then(|res| res.into_string().map_err(Into::into))
+            {
+                Ok(body) => body,
+                Err(err) => format!("balances request failed: {err}"),
+            };
+
             if let Err(err) = ureq::post(&format!("{api}/sendMessage"))
-                .send_json(json!({ "chat_id": chat_id, "text": "Hello!" }))
+                .send_json(json!({ "chat_id": chat_id, "text": text }))
             {
                 eprintln!("sendMessage failed: {err}");
             }
