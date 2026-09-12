@@ -1,4 +1,6 @@
 use std::env;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -110,6 +112,47 @@ fn build_plan(
     Plan::from_json_str(content)
 }
 
+/// Pipes `input` through a real `jq` subprocess running `filter` and returns its stdout.
+fn run_jq(input: &str, filter: &str) -> Result<String, String> {
+    let mut jq = Command::new("jq")
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn jq: {err}"))?;
+
+    jq.stdin
+        .take()
+        .expect("jq was spawned with a piped stdin")
+        .write_all(input.as_bytes())
+        .map_err(|err| format!("failed to write to jq's stdin: {err}"))?;
+
+    let output = jq
+        .wait_with_output()
+        .map_err(|err| format!("failed to wait for jq: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "jq filter failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    String::from_utf8(output.stdout).map_err(|err| format!("jq produced invalid UTF-8: {err}"))
+}
+
+/// Runs a Plan: GET pennywise at the chosen endpoint, then pipes the response body through
+/// the Plan's jq filter.
+fn execute_plan(pennywise_url: &str, plan: &Plan) -> Result<String, String> {
+    let body = ureq::get(&format!("{pennywise_url}{}", plan.endpoint))
+        .call()
+        .and_then(|res| res.into_string().map_err(Into::into))
+        .map_err(|err| format!("endpoint request failed: {err}"))?;
+
+    run_jq(&body, &plan.jq_filter)
+}
+
 fn send_message(api: &str, chat_id: i64, text: &str) {
     if let Err(err) = ureq::post(&format!("{api}/sendMessage"))
         .send_json(json!({ "chat_id": chat_id, "text": text }))
@@ -172,12 +215,12 @@ fn main() {
 
             let reply = match build_plan(&openrouter_api_key, &openrouter_model, &api_schema, text)
             {
-                // TODO(#4, #5): execute the plan (GET + jq) and run the Reply Call instead
-                // of echoing the plan itself.
-                Ok(plan) => format!(
-                    "plan: GET {} | jq: {} | reply_system_prompt: {}",
-                    plan.endpoint, plan.jq_filter, plan.reply_system_prompt
-                ),
+                Ok(plan) => match execute_plan(&pennywise_url, &plan) {
+                    // TODO(#5): run the Reply Call using plan.reply_system_prompt instead of
+                    // echoing the raw jq output.
+                    Ok(result) => result,
+                    Err(err) => err,
+                },
                 Err(err) => err,
             };
 
@@ -232,5 +275,20 @@ mod tests {
     fn plan_from_json_str_rejects_missing_field() {
         let content = r#"{"endpoint":"/balances","jq_filter":"."}"#;
         assert!(Plan::from_json_str(content).is_err());
+    }
+
+    #[test]
+    fn run_jq_applies_the_filter() {
+        let input = r#"[{"account_name":"Swedbank"},{"account_name":"Revolut"}]"#;
+        let result = run_jq(input, r#"map(select(.account_name | test("swedbank"; "i")))"#)
+            .unwrap();
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed, json!([{"account_name": "Swedbank"}]));
+    }
+
+    #[test]
+    fn run_jq_reports_an_invalid_filter() {
+        assert!(run_jq("{}", "not valid jq").is_err());
     }
 }

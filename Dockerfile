@@ -15,6 +15,8 @@ RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim
 
+RUN apt-get update && apt-get install -y --no-install-recommends jq && rm -rf /var/lib/apt/lists/*
+
 RUN useradd --system --create-home --uid 10001 --user-group ien
 
 COPY --from=builder /build/target/release/ien-telegram-bot /usr/local/bin/ien-telegram-bot
