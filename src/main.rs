@@ -221,6 +221,50 @@ fn execute_plan(pennywise_url: &str, plan: &Plan) -> Result<String, String> {
     run_jq(&body, &plan.jq_filter)
 }
 
+/// True when `text` invokes the given slash command, e.g. `/balances` or `/balances@ien_bot`
+/// (Telegram appends `@<bot username>` to commands in group chats) with optional trailing
+/// arguments. Anything else (plain conversation, a different command) goes through the LLM.
+fn is_command(text: &str, command: &str) -> bool {
+    let first_word = text.split_whitespace().next().unwrap_or("");
+    let name = first_word.split('@').next().unwrap_or("");
+    name == command
+}
+
+/// Formats pennywise's `GET /balances` response (one row per own account: `account_name`,
+/// `balance` in major units, `currency`) as plain text, one account per line.
+fn format_balances(balances: &Value) -> Result<String, String> {
+    let rows = balances
+        .as_array()
+        .ok_or_else(|| format!("balances response was not a JSON array: {balances}"))?;
+
+    if rows.is_empty() {
+        return Ok("No accounts.".to_string());
+    }
+
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let name = row["account_name"].as_str().unwrap_or("?");
+            let balance = row["balance"].as_f64().unwrap_or(0.0);
+            let currency = row["currency"].as_str().unwrap_or("");
+            format!("{name}: {balance:.2} {currency}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Handles `/balances` directly against pennywise, bypassing the routing and reply LLM calls
+/// entirely: the endpoint and the shape of the reply are both fixed, so there's nothing for
+/// an LLM to decide.
+fn handle_balances_command(pennywise_url: &str) -> Result<String, String> {
+    let balances: Value = ureq::get(&format!("{pennywise_url}/balances"))
+        .call()
+        .and_then(|res| res.into_json::<Value>().map_err(Into::into))
+        .map_err(|err| format!("failed to fetch balances: {err}"))?;
+
+    format_balances(&balances)
+}
+
 fn send_message(api: &str, chat_id: i64, text: &str) {
     if let Err(err) = ureq::post(&format!("{api}/sendMessage"))
         .send_json(json!({ "chat_id": chat_id, "text": text }))
@@ -286,6 +330,15 @@ fn main() {
             let Some(text) = update["message"]["text"].as_str() else {
                 continue;
             };
+
+            if is_command(text, "/balances") {
+                let reply = handle_balances_command(&pennywise_url).unwrap_or_else(|err| {
+                    eprintln!("chat {chat_id}: {err}");
+                    err
+                });
+                send_message(&api, chat_id, &reply);
+                continue;
+            }
 
             let api_schema: Value = match ureq::get(&format!("{pennywise_url}/openapi.json"))
                 .call()
@@ -442,6 +495,54 @@ mod tests {
     #[test]
     fn run_jq_reports_an_invalid_filter() {
         assert!(run_jq("{}", "not valid jq").is_err());
+    }
+
+    #[test]
+    fn is_command_matches_the_bare_command() {
+        assert!(is_command("/balances", "/balances"));
+    }
+
+    #[test]
+    fn is_command_matches_with_bot_username_suffix() {
+        assert!(is_command("/balances@ien_bot", "/balances"));
+    }
+
+    #[test]
+    fn is_command_matches_with_trailing_arguments() {
+        assert!(is_command("/balances please", "/balances"));
+    }
+
+    #[test]
+    fn is_command_rejects_plain_conversation() {
+        assert!(!is_command("what are my balances?", "/balances"));
+    }
+
+    #[test]
+    fn is_command_rejects_a_different_command() {
+        assert!(!is_command("/accounts", "/balances"));
+    }
+
+    #[test]
+    fn format_balances_lists_one_line_per_account() {
+        let balances = json!([
+            {"account_id": 1, "account_name": "Swedbank", "balance": 1234.5, "currency": "EUR"},
+            {"account_id": 2, "account_name": "Revolut", "balance": 0, "currency": "USD"}
+        ]);
+
+        assert_eq!(
+            format_balances(&balances).unwrap(),
+            "Swedbank: 1234.50 EUR\nRevolut: 0.00 USD"
+        );
+    }
+
+    #[test]
+    fn format_balances_reports_no_accounts() {
+        assert_eq!(format_balances(&json!([])).unwrap(), "No accounts.");
+    }
+
+    #[test]
+    fn format_balances_rejects_a_non_array_response() {
+        assert!(format_balances(&json!({"error": "oops"})).is_err());
     }
 
     #[test]
