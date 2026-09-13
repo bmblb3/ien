@@ -63,6 +63,13 @@ impl Plan {
     }
 }
 
+/// True when `update`'s message was sent by the configured owner, identified by Telegram's
+/// per-user `from.id` rather than `chat.id`: `chat.id` only coincides with the sender in a
+/// private 1:1 chat, and would wrongly treat every member of a group chat as the owner.
+fn is_from_owner(update: &Value, owner_id: i64) -> bool {
+    update["message"]["from"]["id"].as_i64() == Some(owner_id)
+}
+
 /// Paths pennywise's OpenAPI schema exposes a GET method for.
 fn get_endpoints(api_schema: &Value) -> Vec<String> {
     api_schema["paths"]
@@ -225,6 +232,10 @@ fn send_message(api: &str, chat_id: i64, text: &str) {
 fn main() {
     let token = env::var("TELEGRAM_BOT_TOKEN")
         .expect("set TELEGRAM_BOT_TOKEN to the token from @BotFather");
+    let owner_id: i64 = env::var("TELEGRAM_OWNER_ID")
+        .expect("set TELEGRAM_OWNER_ID to your Telegram user id, e.g. from @userinfobot")
+        .parse()
+        .unwrap_or_else(|_| panic!("TELEGRAM_OWNER_ID must be an integer Telegram user id"));
     let pennywise_url = env::var("PENNYWISE_URL")
         .expect("set PENNYWISE_URL to the pennywise base URL, e.g. http://pennywise:8080");
     let openrouter_api_key =
@@ -260,6 +271,14 @@ fn main() {
 
         for update in updates["result"].as_array().into_iter().flatten() {
             offset = update["update_id"].as_i64().unwrap_or(offset) + 1;
+
+            if !is_from_owner(&update, owner_id) {
+                eprintln!(
+                    "ignored message from sender {:?}: not the configured owner",
+                    update["message"]["from"]["id"]
+                );
+                continue;
+            }
 
             let Some(chat_id) = update["message"]["chat"]["id"].as_i64() else {
                 continue;
@@ -346,6 +365,24 @@ mod tests {
     #[test]
     fn read_prompt_file_treats_a_missing_file_as_empty() {
         assert_eq!(read_prompt_file("does/not/exist.md"), "");
+    }
+
+    #[test]
+    fn is_from_owner_matches_the_configured_id() {
+        let update = json!({"message": {"from": {"id": 42}}});
+        assert!(is_from_owner(&update, 42));
+    }
+
+    #[test]
+    fn is_from_owner_rejects_a_different_id() {
+        let update = json!({"message": {"from": {"id": 7}}});
+        assert!(!is_from_owner(&update, 42));
+    }
+
+    #[test]
+    fn is_from_owner_rejects_a_missing_from_field() {
+        let update = json!({"message": {"text": "hi"}});
+        assert!(!is_from_owner(&update, 42));
     }
 
     #[test]
