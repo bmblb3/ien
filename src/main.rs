@@ -246,11 +246,11 @@ fn main() {
         env::var("ROUTING_PROMPT_PATH").unwrap_or_else(|_| "prompts/routing.md".to_string());
     let reply_prompt_path =
         env::var("REPLY_PROMPT_PATH").unwrap_or_else(|_| "prompts/reply.md".to_string());
-    let local_timezone = env::var("LOCAL_TIMEZONE")
-        .expect("set LOCAL_TIMEZONE to an IANA timezone name, e.g. Europe/Riga");
+    let local_timezone =
+        env::var("TZ").expect("set TZ to an IANA timezone name, e.g. Europe/Riga");
     let tz: Tz = local_timezone
         .parse()
-        .unwrap_or_else(|_| panic!("LOCAL_TIMEZONE '{local_timezone}' is not a valid IANA timezone name"));
+        .unwrap_or_else(|_| panic!("TZ '{local_timezone}' is not a valid IANA timezone name"));
     let api = format!("https://api.telegram.org/bot{token}");
 
     let mut offset = 0i64;
