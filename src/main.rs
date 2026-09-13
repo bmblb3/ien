@@ -5,14 +5,38 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde_json::Value;
 use ureq::json;
 
+/// The routing system prompt's fixed core: compiled into the binary so the bot
+/// works correctly even if no overlay is mounted, instead of depending on a
+/// runtime file that could be missing or misconfigured.
+const ROUTING_SYSTEM_PROMPT_BASE: &str = include_str!("../prompts/routing.md");
+
 /// Reads a prompt file fresh on every call, so editing prompt wording takes effect
-/// on the next message without restarting or recompiling the bot.
+/// on the next message without restarting or recompiling the bot. A missing file
+/// means "nothing to add here" and returns an empty string; any other read error
+/// (bad permissions, a broken mount, ...) still panics, since that's an actual
+/// misconfiguration rather than an absent, optional overlay.
 fn read_prompt_file(path: &str) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_else(|err| panic!("failed to read prompt file '{path}': {err}"))
+    match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => panic!("failed to read prompt file '{path}': {err}"),
+    }
+}
+
+/// Formats "today" in the given timezone as e.g. "2026-09-13 (Sunday), Europe/Riga",
+/// so the Routing Call can resolve relative date phrases ("last month", "this week")
+/// against a concrete anchor instead of its own (possibly stale) sense of the date.
+fn format_today_at(now: DateTime<Tz>, local_timezone: &str) -> String {
+    format!(
+        "{} ({}), {local_timezone}",
+        now.format("%Y-%m-%d"),
+        now.format("%A")
+    )
 }
 
 struct Plan {
@@ -81,6 +105,7 @@ fn build_plan(
     routing_system_prompt: &str,
     api_schema: &Value,
     user_message: &str,
+    today: &str,
 ) -> Result<Plan, String> {
     let endpoints = get_endpoints(api_schema);
     if endpoints.is_empty() {
@@ -93,7 +118,7 @@ fn build_plan(
         "messages": [
             {"role": "system", "content": routing_system_prompt},
             {"role": "user", "content": format!(
-                "User's message: {user_message}\n\nPennywise's OpenAPI schema:\n{api_schema}"
+                "User's message: {user_message}\n\nToday's date: {today}\n\nPennywise's OpenAPI schema:\n{api_schema}"
             )}
         ],
         "response_format": {
@@ -210,6 +235,11 @@ fn main() {
         env::var("ROUTING_PROMPT_PATH").unwrap_or_else(|_| "prompts/routing.md".to_string());
     let reply_prompt_path =
         env::var("REPLY_PROMPT_PATH").unwrap_or_else(|_| "prompts/reply.md".to_string());
+    let local_timezone = env::var("LOCAL_TIMEZONE")
+        .expect("set LOCAL_TIMEZONE to an IANA timezone name, e.g. Europe/Riga");
+    let tz: Tz = local_timezone
+        .parse()
+        .unwrap_or_else(|_| panic!("LOCAL_TIMEZONE '{local_timezone}' is not a valid IANA timezone name"));
     let api = format!("https://api.telegram.org/bot{token}");
 
     let mut offset = 0i64;
@@ -253,8 +283,14 @@ fn main() {
                 }
             };
 
-            let routing_system_prompt = read_prompt_file(&routing_prompt_path);
+            let routing_overlay = read_prompt_file(&routing_prompt_path);
+            let routing_system_prompt = if routing_overlay.is_empty() {
+                ROUTING_SYSTEM_PROMPT_BASE.to_string()
+            } else {
+                format!("{ROUTING_SYSTEM_PROMPT_BASE}\n\n{routing_overlay}")
+            };
             let reply_style = read_prompt_file(&reply_prompt_path);
+            let today = format_today_at(Utc::now().with_timezone(&tz), &local_timezone);
 
             let result: Result<String, String> = build_plan(
                 &openrouter_api_key,
@@ -262,6 +298,7 @@ fn main() {
                 &routing_system_prompt,
                 &api_schema,
                 text,
+                &today,
             )
             .and_then(|plan| {
                 eprintln!(
@@ -290,6 +327,26 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn format_today_at_includes_date_weekday_and_timezone() {
+        let tz: Tz = "Europe/Riga".parse().unwrap();
+        let now = Utc
+            .with_ymd_and_hms(2026, 9, 13, 8, 0, 0)
+            .unwrap()
+            .with_timezone(&tz);
+
+        assert_eq!(
+            format_today_at(now, "Europe/Riga"),
+            "2026-09-13 (Sunday), Europe/Riga"
+        );
+    }
+
+    #[test]
+    fn read_prompt_file_treats_a_missing_file_as_empty() {
+        assert_eq!(read_prompt_file("does/not/exist.md"), "");
+    }
 
     #[test]
     fn get_endpoints_keeps_only_get_methods() {
