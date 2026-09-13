@@ -106,6 +106,21 @@ fn plan_json_schema(endpoints: &[String]) -> Value {
     })
 }
 
+/// Posts `body` to OpenRouter's chat completions endpoint and returns the first choice's
+/// message content. `context` (e.g. "routing call") labels the error on failure.
+fn call_openrouter(openrouter_api_key: &str, body: Value, context: &str) -> Result<String, String> {
+    let response: Value = ureq::post("https://openrouter.ai/api/v1/chat/completions")
+        .set("Authorization", &format!("Bearer {openrouter_api_key}"))
+        .send_json(body)
+        .and_then(|res| res.into_json::<Value>().map_err(Into::into))
+        .map_err(|err| format!("{context} failed: {err}"))?;
+
+    response["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("{context} returned no content: {response}"))
+}
+
 fn build_plan(
     openrouter_api_key: &str,
     openrouter_model: &str,
@@ -138,17 +153,8 @@ fn build_plan(
         }
     });
 
-    let response: Value = ureq::post("https://openrouter.ai/api/v1/chat/completions")
-        .set("Authorization", &format!("Bearer {openrouter_api_key}"))
-        .send_json(body)
-        .and_then(|res| res.into_json::<Value>().map_err(Into::into))
-        .map_err(|err| format!("routing call failed: {err}"))?;
-
-    let content = response["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| format!("routing call returned no content: {response}"))?;
-
-    Plan::from_json_str(content)
+    let content = call_openrouter(openrouter_api_key, body, "routing call")?;
+    Plan::from_json_str(&content)
 }
 
 /// The Reply Call: turns a Plan's jq'd JSON output into a final plain-text reply, using the
@@ -168,16 +174,7 @@ fn build_reply(
         ]
     });
 
-    let response: Value = ureq::post("https://openrouter.ai/api/v1/chat/completions")
-        .set("Authorization", &format!("Bearer {openrouter_api_key}"))
-        .send_json(body)
-        .and_then(|res| res.into_json::<Value>().map_err(Into::into))
-        .map_err(|err| format!("reply call failed: {err}"))?;
-
-    response["choices"][0]["message"]["content"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| format!("reply call returned no content: {response}"))
+    call_openrouter(openrouter_api_key, body, "reply call")
 }
 
 /// Pipes `input` through a real `jq` subprocess running `filter` and returns its stdout.
@@ -221,13 +218,13 @@ fn execute_plan(pennywise_url: &str, plan: &Plan) -> Result<String, String> {
     run_jq(&body, &plan.jq_filter)
 }
 
-/// True when `text` invokes the given slash command, e.g. `/balances` or `/balances@ien_bot`
-/// (Telegram appends `@<bot username>` to commands in group chats) with optional trailing
-/// arguments. Anything else (plain conversation, a different command) goes through the LLM.
-fn is_command(text: &str, command: &str) -> bool {
+/// True when `text` invokes `/balances`, e.g. `/balances` or `/balances@ien_bot` (Telegram
+/// appends `@<bot username>` to commands in group chats) with optional trailing arguments.
+/// Anything else (plain conversation, a different command) goes through the LLM.
+fn is_balances_command(text: &str) -> bool {
     let first_word = text.split_whitespace().next().unwrap_or("");
     let name = first_word.split('@').next().unwrap_or("");
-    name == command
+    name == "/balances"
 }
 
 /// Formats pennywise's `GET /balances` response (one row per own account: `account_name`,
@@ -331,7 +328,7 @@ fn main() {
                 continue;
             };
 
-            if is_command(text, "/balances") {
+            if is_balances_command(text) {
                 let reply = handle_balances_command(&pennywise_url).unwrap_or_else(|err| {
                     eprintln!("chat {chat_id}: {err}");
                     err
@@ -498,28 +495,28 @@ mod tests {
     }
 
     #[test]
-    fn is_command_matches_the_bare_command() {
-        assert!(is_command("/balances", "/balances"));
+    fn is_balances_command_matches_the_bare_command() {
+        assert!(is_balances_command("/balances"));
     }
 
     #[test]
-    fn is_command_matches_with_bot_username_suffix() {
-        assert!(is_command("/balances@ien_bot", "/balances"));
+    fn is_balances_command_matches_with_bot_username_suffix() {
+        assert!(is_balances_command("/balances@ien_bot"));
     }
 
     #[test]
-    fn is_command_matches_with_trailing_arguments() {
-        assert!(is_command("/balances please", "/balances"));
+    fn is_balances_command_matches_with_trailing_arguments() {
+        assert!(is_balances_command("/balances please"));
     }
 
     #[test]
-    fn is_command_rejects_plain_conversation() {
-        assert!(!is_command("what are my balances?", "/balances"));
+    fn is_balances_command_rejects_plain_conversation() {
+        assert!(!is_balances_command("what are my balances?"));
     }
 
     #[test]
-    fn is_command_rejects_a_different_command() {
-        assert!(!is_command("/accounts", "/balances"));
+    fn is_balances_command_rejects_a_different_command() {
+        assert!(!is_balances_command("/accounts"));
     }
 
     #[test]
