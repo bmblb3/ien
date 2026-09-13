@@ -228,17 +228,32 @@ fn is_balances_command(text: &str) -> bool {
 }
 
 /// Formats pennywise's `GET /balances` response (one row per own account: `account_name`,
-/// `balance` in major units, `currency`) as plain text, one account per line.
+/// `balance` in major units, `currency`) as plain text, one account per line, ascending by
+/// balance. Rows within epsilon of zero are dropped: pennywise has no exchange rates, so
+/// there's no way to normalize across currencies before sorting, and near-zero float dust
+/// from a genuinely-zero account isn't worth a line.
 fn format_balances(balances: &Value) -> Result<String, String> {
     let rows = balances
         .as_array()
         .ok_or_else(|| format!("balances response was not a JSON array: {balances}"))?;
 
-    if rows.is_empty() {
+    let mut nonzero: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["balance"].as_f64().unwrap_or(0.0).abs() >= 0.005)
+        .collect();
+
+    if nonzero.is_empty() {
         return Ok("No accounts.".to_string());
     }
 
-    Ok(rows
+    nonzero.sort_by(|a, b| {
+        a["balance"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&b["balance"].as_f64().unwrap_or(0.0))
+    });
+
+    Ok(nonzero
         .iter()
         .map(|row| {
             let name = row["account_name"].as_str().unwrap_or("?");
@@ -520,21 +535,59 @@ mod tests {
     }
 
     #[test]
-    fn format_balances_lists_one_line_per_account() {
+    fn format_balances_sorts_ascending_by_balance() {
         let balances = json!([
             {"account_id": 1, "account_name": "Swedbank", "balance": 1234.5, "currency": "EUR"},
-            {"account_id": 2, "account_name": "Revolut", "balance": 0, "currency": "USD"}
+            {"account_id": 2, "account_name": "Revolut", "balance": -50.0, "currency": "USD"},
+            {"account_id": 3, "account_name": "Cash", "balance": 10.0, "currency": "EUR"}
         ]);
 
         assert_eq!(
             format_balances(&balances).unwrap(),
-            "Swedbank: 1234.50 EUR\nRevolut: 0.00 USD"
+            "Revolut: -50.00 USD\nCash: 10.00 EUR\nSwedbank: 1234.50 EUR"
         );
     }
 
     #[test]
-    fn format_balances_reports_no_accounts() {
+    fn format_balances_trims_a_zero_balance() {
+        let balances = json!([
+            {"account_id": 1, "account_name": "Swedbank", "balance": 1234.5, "currency": "EUR"},
+            {"account_id": 2, "account_name": "Empty", "balance": 0.0, "currency": "EUR"}
+        ]);
+
+        assert_eq!(format_balances(&balances).unwrap(), "Swedbank: 1234.50 EUR");
+    }
+
+    #[test]
+    fn format_balances_trims_near_zero_float_dust() {
+        let balances = json!([
+            {"account_id": 1, "account_name": "Dust", "balance": 0.001, "currency": "EUR"}
+        ]);
+
+        assert_eq!(format_balances(&balances).unwrap(), "No accounts.");
+    }
+
+    #[test]
+    fn format_balances_keeps_a_balance_just_outside_the_epsilon() {
+        let balances = json!([
+            {"account_id": 1, "account_name": "Small", "balance": 0.01, "currency": "EUR"}
+        ]);
+
+        assert_eq!(format_balances(&balances).unwrap(), "Small: 0.01 EUR");
+    }
+
+    #[test]
+    fn format_balances_reports_no_accounts_on_an_empty_response() {
         assert_eq!(format_balances(&json!([])).unwrap(), "No accounts.");
+    }
+
+    #[test]
+    fn format_balances_reports_no_accounts_when_everything_is_trimmed() {
+        let balances = json!([
+            {"account_id": 1, "account_name": "Empty", "balance": 0.0, "currency": "EUR"}
+        ]);
+
+        assert_eq!(format_balances(&balances).unwrap(), "No accounts.");
     }
 
     #[test]
